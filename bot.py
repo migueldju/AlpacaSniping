@@ -16,7 +16,6 @@ import argparse
 import logging
 import os
 import sys
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -111,18 +110,15 @@ def fetch_crypto_batch(symbols: list[str], days: int) -> dict:
 def load_universe(path=None) -> list[Market]:
     path = Path(path or config.UNIVERSE_FILE)
     symbols = [line.split("#")[0].strip() for line in path.read_text().splitlines()]
-    return [Market(s, s.replace(".", "-"), "stock", config.STOCK_TRADE_SIZE) for s in symbols if s]
+    # trade_size is unused here: universe orders are sized in dollars by order_usd()
+    return [Market(s, s.replace(".", "-"), "stock", 0) for s in symbols if s]
 
 
 def crypto_universe() -> list[Market]:
-    # trade_size is set per run from the price and CRYPTO_ORDER_USD
     return [Market(s, s, "crypto", 0) for s in config.CRYPTO_UNIVERSE]
 
 
-UNIVERSES = {
-    "stocks": (load_universe, "MAX_BUYS_PER_RUN"),
-    "crypto": (crypto_universe, "MAX_CRYPTO_BUYS_PER_RUN"),
-}
+UNIVERSES = {"stocks": load_universe, "crypto": crypto_universe}
 
 
 def position_key(symbol: str) -> str:
@@ -169,17 +165,20 @@ def time_in_force(asset_class: str):
     return TimeInForce.GTC if asset_class == "crypto" else TimeInForce.DAY
 
 
-def place_order(client, market: Market, qty: float, side: str):
+def place_order(client, market: Market, qty: float | None, side: str, notional: float | None = None):
+    """Market order for qty units, or for a dollar amount (notional) when qty is None."""
     from alpaca.trading.enums import OrderSide
     from alpaca.trading.requests import MarketOrderRequest
 
     order = client.submit_order(MarketOrderRequest(
         symbol=market.symbol,
         qty=qty,
+        notional=notional,
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=time_in_force(market.asset_class),
     ))
-    log.info("Order submitted: %s %g %s (id %s, status %s)", side, qty, market.symbol, order.id, order.status.value)
+    size = f"${notional:,.2f} of" if qty is None else f"{qty:g}"
+    log.info("Order submitted: %s %s %s (id %s, status %s)", side, size, market.symbol, order.id, order.status.value)
     return order
 
 
@@ -219,39 +218,38 @@ def run(market: Market, dry_run: bool) -> str:
     return f"{sym} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
 
 
-def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_symbols: set, max_buys: int):
-    """Decide which signals become orders. Returns (orders, notes), orders as (market, side, qty).
+def order_usd(gap_pct: float) -> float:
+    """Dollar size of an order: proportional to how far the fast MA crossed past the slow one."""
+    return round(max(config.MIN_ORDER_USD, abs(gap_pct) * config.ORDER_USD_PER_GAP_PCT), 2)
 
-    Sells first, only for symbols held (never short). Buys in the given order (most traded first),
-    skipping symbols already held, and at most max_buys of them. Symbols with an open order are skipped.
+
+def plan_orders(signals: list, positions: dict, traded_today: set):
+    """Decide which signals become orders. Returns (orders, notes).
+
+    signals: (market, side, gap_pct, price) for every BUY/SELL. orders: (market, side, qty, notional, usd).
+    Buys are sized in dollars (notional); sells sell the same dollar amount in units, never more than held
+    (never short). Symbols already ordered today are skipped, so a second run on the same day doesn't repeat.
     """
     positions = {position_key(k): v for k, v in positions.items()}
-    open_symbols = {position_key(k) for k in open_symbols}
+    traded_today = {position_key(k) for k in traded_today}
     orders, notes = [], []
-    for m in sells:
-        qty = positions.get(position_key(m.symbol), 0.0)
-        if position_key(m.symbol) in open_symbols:
-            notes.append(f"{m.symbol} SELL skipped: order already open")
-        elif qty <= 0:
+    for m, side, gap, price in signals:
+        usd = order_usd(gap)
+        held = positions.get(position_key(m.symbol), 0.0)
+        if position_key(m.symbol) in traded_today:
+            notes.append(f"{m.symbol} {side.upper()} skipped: already ordered today")
+        elif side == "buy":
+            orders.append((m, "buy", None, usd, usd))
+        elif held <= 0:
             notes.append(f"{m.symbol} SELL skipped: not held")
         else:
-            orders.append((m, "sell", min(m.trade_size, qty)))
-    n_buys = 0
-    for m in buys:
-        if position_key(m.symbol) in open_symbols:
-            notes.append(f"{m.symbol} BUY skipped: order already open")
-        elif positions.get(position_key(m.symbol), 0.0) > 0:
-            notes.append(f"{m.symbol} BUY skipped: already held")
-        elif n_buys >= max_buys:
-            notes.append(f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached")
-        else:
-            orders.append((m, "buy", m.trade_size))
-            n_buys += 1
+            qty = held if usd / price >= held * 0.999 else int(usd / price * 1e9) / 1e9
+            orders.append((m, "sell", qty, None, round(qty * price, 2)))
     return orders, notes
 
 
-def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
-    """One run over many symbols: batch download, one log line per symbol, then capped orders."""
+def run_universe(markets: list[Market], dry_run: bool) -> str:
+    """One run over many symbols: batch download, one log line per symbol, then orders sized by signal strength."""
     log.info("Universe: %d symbols", len(markets))
     stock_tickers = [m.data_symbol for m in markets if m.asset_class != "crypto"]
     crypto_symbols = [m.data_symbol for m in markets if m.asset_class == "crypto"]
@@ -259,7 +257,7 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
     if crypto_symbols:
         bars.update(fetch_crypto_batch(crypto_symbols, config.LOOKBACK_DAYS))
     now = datetime.now(NY)
-    buys, sells, n_hold, n_skipped = [], [], 0, 0
+    signals, n_hold, n_skipped = [], 0, 0
     for m in markets:
         if m.data_symbol not in bars:
             log.info("%-6s no price data, skipped", m.symbol)
@@ -274,18 +272,19 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
             n_skipped += 1
             continue
         r = df.iloc[-1]
-        if m.asset_class == "crypto":
-            m = replace(m, trade_size=round(config.CRYPTO_ORDER_USD / r.close, 9))
-        log.info("%-6s %s  close %.6g  MA%d %.6g  MA%d %.6g  %s", m.symbol, df.index[-1].date(), r.close,
-                 config.FAST_MA_PERIOD, r.fast_ma, config.SLOW_MA_PERIOD, r.slow_ma, signal.value.upper())
-        if signal is Signal.BUY:
-            buys.append(m)
-        elif signal is Signal.SELL:
-            sells.append(m)
-        else:
+        gap = (r.fast_ma / r.slow_ma - 1) * 100
+        log.info("%-6s %s  close %.6g  MA%d %.6g  MA%d %.6g  gap %+.3f%%  %s", m.symbol, df.index[-1].date(), r.close,
+                 config.FAST_MA_PERIOD, r.fast_ma, config.SLOW_MA_PERIOD, r.slow_ma, gap, signal.value.upper())
+        if signal is Signal.HOLD:
             n_hold += 1
-    summary = (f"{len(markets)} symbols: {len(buys)} BUY [{' '.join(m.symbol for m in buys)}], "
-               f"{len(sells)} SELL [{' '.join(m.symbol for m in sells)}], {n_hold} HOLD, {n_skipped} skipped")
+        else:
+            signals.append((m, signal.value, gap, r.close))
+
+    def listing(side):
+        picked = [(m, gap) for m, sd, gap, _ in signals if sd == side]
+        return f"{len(picked)} {side.upper()} [{' '.join(f'{m.symbol} ${order_usd(g):,.0f}' for m, g in picked)}]"
+
+    summary = f"{len(markets)} symbols: {listing('buy')}, {listing('sell')}, {n_hold} HOLD, {n_skipped} skipped"
     log.info("Signals: %s", summary)
     if dry_run:
         return f"{summary}; dry run, no orders placed"
@@ -295,19 +294,22 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
 
     client = trading_client()
     positions = {p.symbol: float(p.qty) for p in client.get_all_positions()}
-    open_symbols = {o.symbol for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))}
-    orders, notes = plan_orders(buys, sells, positions, open_symbols, max_buys)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    traded_today = {o.symbol for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, after=start_of_day, limit=500))}
+    orders, notes = plan_orders(signals, positions, traded_today)
     for note in notes:
         log.info(note)
-    placed, failed = [], []
-    for m, side, qty in orders:
+    placed, failed, total = [], [], {"buy": 0.0, "sell": 0.0}
+    for m, side, qty, notional, usd in orders:
         try:
-            place_order(client, m, qty, side)
-            placed.append(f"{side} {qty:g} {m.symbol}")
+            place_order(client, m, qty, side, notional)
+            placed.append(f"{side} ${usd:,.0f} {m.symbol}")
+            total[side] += usd
         except Exception as exc:
             log.error("%s %s failed: %s", side, m.symbol, exc)
             failed.append(m.symbol)
-    result = f"{summary}; orders placed: {', '.join(placed) or 'none'}"
+    result = (f"{summary}; orders placed: {', '.join(placed) or 'none'} "
+              f"(bought ${total['buy']:,.0f}, sold ${total['sell']:,.0f})")
     if failed:
         result += f"; failed: {' '.join(failed)}"
     return result
@@ -327,9 +329,8 @@ def main():
     mode = "dry run" if args.dry_run else "live, paper account"
     try:
         if args.market in UNIVERSES:
-            load, cap_setting = UNIVERSES[args.market]
             log.info("=== Run started: %s universe (%s) ===", args.market, mode)
-            outcome = run_universe(load(), args.dry_run, getattr(config, cap_setting))
+            outcome = run_universe(UNIVERSES[args.market](), args.dry_run)
         else:
             market = config.MARKETS[args.market]
             log.info("=== Run started: %s (%s) ===", market.symbol, mode)

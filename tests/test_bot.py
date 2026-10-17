@@ -7,7 +7,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
-from bot import drop_unfinished_bar, load_universe, plan_orders, time_in_force  # noqa: E402
+from bot import drop_unfinished_bar, load_universe, order_usd, plan_orders, time_in_force  # noqa: E402
 from alpaca.trading.enums import TimeInForce  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
@@ -59,24 +59,32 @@ def stock(symbol):
     return config.Market(symbol, symbol, "stock", 1)
 
 
-def test_plan_orders_caps_buys_in_order():
-    buys = [stock(s) for s in ["KO", "LIN", "SAP", "AIG"]]
-    orders, notes = plan_orders(buys, [], {}, set(), max_buys=2)
-    assert [(m.symbol, side) for m, side, _ in orders] == [("KO", "buy"), ("LIN", "buy")]
-    assert any("SAP" in n and "limit" in n for n in notes)
+def test_order_size_grows_with_the_gap():
+    assert order_usd(0.1) == 100
+    assert order_usd(1.5) == 1500
+    assert order_usd(-0.5) == 500  # sells use the size of the gap, not its sign
+    assert order_usd(0.001) == config.MIN_ORDER_USD
 
 
-def test_plan_orders_skips_held_and_open_without_using_the_cap():
-    buys = [stock(s) for s in ["KO", "LIN", "SAP"]]
-    orders, _ = plan_orders(buys, [], {"KO": 1.0}, {"LIN"}, max_buys=1)
-    assert [m.symbol for m, _, _ in orders] == ["SAP"]
+def test_plan_orders_buys_every_signal_sized_by_gap():
+    signals = [(stock(s), "buy", gap, 100.0) for s, gap in [("KO", 0.01), ("LIN", 0.2), ("CBRL", 1.6)]]
+    orders, _ = plan_orders(signals, {}, set())
+    assert [(m.symbol, side, qty, notional) for m, side, qty, notional, _ in orders] == [
+        ("KO", "buy", None, 10), ("LIN", "buy", None, 200), ("CBRL", "buy", None, 1600)]
 
 
-def test_plan_orders_sells_only_held_and_never_more_than_held():
-    sells = [stock("STX"), stock("GLW")]
-    orders, notes = plan_orders([], sells, {"STX": 0.5}, set(), max_buys=0)
-    assert [(m.symbol, side, qty) for m, side, qty in orders] == [("STX", "sell", 0.5)]
-    assert any("GLW" in n and "not held" in n for n in notes)
+def test_plan_orders_buys_more_of_held_but_skips_symbols_ordered_today():
+    signals = [(stock("KO"), "buy", 0.5, 60.0), (stock("LIN"), "buy", 0.5, 500.0)]
+    orders, notes = plan_orders(signals, {"KO": 1.0}, {"LIN"})
+    assert [m.symbol for m, *_ in orders] == ["KO"]
+    assert any("LIN" in n and "today" in n for n in notes)
+
+
+def test_plan_orders_sells_gap_sized_amount_never_more_than_held():
+    signals = [(stock("STX"), "sell", -0.2, 100.0), (stock("GLW"), "sell", -5.0, 100.0), (stock("COHR"), "sell", -1.0, 100.0)]
+    orders, notes = plan_orders(signals, {"STX": 10.0, "GLW": 3.0}, set())
+    assert [(m.symbol, side, qty) for m, side, qty, *_ in orders] == [("STX", "sell", 2.0), ("GLW", "sell", 3.0)]
+    assert any("COHR" in n and "not held" in n for n in notes)
 
 
 def test_load_universe_ignores_comments_and_maps_class_shares(tmp_path):
@@ -87,10 +95,9 @@ def test_load_universe_ignores_comments_and_maps_class_shares(tmp_path):
 
 
 def test_plan_orders_matches_crypto_positions_without_slash():
-    btc, eth = config.Market("BTC/USD", "BTC-USD", "crypto", 0.001), config.Market("ETH/USD", "ETH-USD", "crypto", 0.04)
-    orders, notes = plan_orders([btc], [eth], {"BTCUSD": 0.001, "ETHUSD": 0.0399}, set(), max_buys=3)
-    assert [(m.symbol, side, qty) for m, side, qty in orders] == [("ETH/USD", "sell", 0.0399)]
-    assert any("BTC/USD" in n and "already held" in n for n in notes)
+    eth = config.Market("ETH/USD", "ETH/USD", "crypto", 0)
+    orders, _ = plan_orders([(eth, "sell", -1.0, 2500.0)], {"ETHUSD": 0.0399}, set())
+    assert [(m.symbol, side, qty) for m, side, qty, *_ in orders] == [("ETH/USD", "sell", 0.0399)]
 
 
 def test_crypto_universe_has_no_stablecoins():
