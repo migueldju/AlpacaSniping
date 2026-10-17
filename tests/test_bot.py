@@ -84,3 +84,17 @@ def test_load_universe_ignores_comments_and_maps_class_shares(tmp_path):
     f.write_text("# header\nAAPL\nBRK.B\n\n")
     markets = load_universe(f)
     assert [(m.symbol, m.data_symbol, m.asset_class) for m in markets] == [("AAPL", "AAPL", "stock"), ("BRK.B", "BRK-B", "stock")]
+
+
+def test_plan_orders_matches_crypto_positions_without_slash():
+    btc, eth = config.Market("BTC/USD", "BTC-USD", "crypto", 0.001), config.Market("ETH/USD", "ETH-USD", "crypto", 0.04)
+    orders, notes = plan_orders([btc], [eth], {"BTCUSD": 0.001, "ETHUSD": 0.0399}, set(), max_buys=3)
+    assert [(m.symbol, side, qty) for m, side, qty in orders] == [("ETH/USD", "sell", 0.0399)]
+    assert any("BTC/USD" in n and "already held" in n for n in notes)
+
+
+def test_crypto_universe_has_no_stablecoins_or_rounded_coins():
+    symbols = set(config.CRYPTO_UNIVERSE)
+    assert "BTC/USD" in symbols
+    assert not symbols & {"USDC/USD", "USDT/USD", "USDG/USD", "BONK/USD", "SHIB/USD", "PEPE/USD"}
+    assert all(s.endswith("/USD") for s in symbols)

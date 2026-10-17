@@ -8,6 +8,10 @@ What it trades is chosen with `--market` or `BOT_MARKET`:
   (average daily traded value of at least `MIN_DOLLAR_VOLUME`, $20M), 1 share each. Data is downloaded in
   batches, every symbol gets one log line, and at most `MAX_BUYS_PER_RUN` (5) new buys are placed per run,
   most traded first. Sells are not capped. Rebuild the list with `python build_universe.py`.
+- `crypto`: every non-stablecoin USD pair on Alpaca listed in `config.CRYPTO_UNIVERSE` (30 coins; BONK, SHIB
+  and PEPE are left out because Yahoo rounds their prices). Each buy is worth `CRYPTO_ORDER_USD` ($100), at
+  most `MAX_CRYPTO_BUYS_PER_RUN` (3) per run. Crypto bars close at 00:00 UTC every day, so run it daily
+  shortly after that (weekends included), separately from the weekday stock run.
 - `aapl` (1 share) and `btc` (BTC/USD, 0.001 BTC), defined in `config.MARKETS`.
 
 ## Setup
@@ -21,6 +25,7 @@ cp .env.example .env   # then put your paper keys in .env
 python bot.py --dry-run   # show the signal, place nothing
 python bot.py             # place the order if a crossover happened
 python bot.py --market btc --dry-run   # same strategy on BTC/USD
+python bot.py --market crypto --dry-run  # all coins
 python bot.py --market aapl            # only AAPL
 python build_universe.py               # refresh the stock list (places no orders)
 pytest                    # unit tests for the crossover logic

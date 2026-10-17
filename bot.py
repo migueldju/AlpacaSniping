@@ -6,6 +6,7 @@ Run once a day (e.g. at the market open):
     python bot.py --market btc --dry-run  # same strategy on BTC/USD (crypto trades 24/7)
 
     python bot.py --market stocks         # every symbol in config.UNIVERSE_FILE (the default)
+    python bot.py --market crypto         # every coin in config.CRYPTO_UNIVERSE
 
 Every run is logged to the console and appended to logs/bot_YYYY-MM-DD.log
 (change the folder with --log-dir or the BOT_LOG_DIR environment variable).
@@ -15,6 +16,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -88,6 +90,22 @@ def load_universe(path=None) -> list[Market]:
     path = Path(path or config.UNIVERSE_FILE)
     symbols = [line.split("#")[0].strip() for line in path.read_text().splitlines()]
     return [Market(s, s.replace(".", "-"), "stock", config.STOCK_TRADE_SIZE) for s in symbols if s]
+
+
+def crypto_universe() -> list[Market]:
+    # trade_size is set per run from the price and CRYPTO_ORDER_USD
+    return [Market(s, t, "crypto", 0) for s, t in config.CRYPTO_UNIVERSE.items()]
+
+
+UNIVERSES = {
+    "stocks": (load_universe, "MAX_BUYS_PER_RUN"),
+    "crypto": (crypto_universe, "MAX_CRYPTO_BUYS_PER_RUN"),
+}
+
+
+def position_key(symbol: str) -> str:
+    """Alpaca reports crypto positions without the slash (BTC/USD -> BTCUSD); compare symbols this way."""
+    return symbol.replace("/", "")
 
 
 def trading_client():
@@ -185,10 +203,12 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
     Sells first, only for symbols held (never short). Buys in the given order (most traded first),
     skipping symbols already held, and at most max_buys of them. Symbols with an open order are skipped.
     """
+    positions = {position_key(k): v for k, v in positions.items()}
+    open_symbols = {position_key(k) for k in open_symbols}
     orders, notes = [], []
     for m in sells:
-        qty = positions.get(m.symbol, 0.0)
-        if m.symbol in open_symbols:
+        qty = positions.get(position_key(m.symbol), 0.0)
+        if position_key(m.symbol) in open_symbols:
             notes.append(f"{m.symbol} SELL skipped: order already open")
         elif qty <= 0:
             notes.append(f"{m.symbol} SELL skipped: not held")
@@ -196,9 +216,9 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
             orders.append((m, "sell", min(m.trade_size, qty)))
     n_buys = 0
     for m in buys:
-        if m.symbol in open_symbols:
+        if position_key(m.symbol) in open_symbols:
             notes.append(f"{m.symbol} BUY skipped: order already open")
-        elif positions.get(m.symbol, 0.0) > 0:
+        elif positions.get(position_key(m.symbol), 0.0) > 0:
             notes.append(f"{m.symbol} BUY skipped: already held")
         elif n_buys >= max_buys:
             notes.append(f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached")
@@ -208,7 +228,7 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
     return orders, notes
 
 
-def run_universe(markets: list[Market], dry_run: bool) -> str:
+def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
     """One run over many symbols: batch download, one log line per symbol, then capped orders."""
     log.info("Universe: %d symbols", len(markets))
     bars = fetch_history_batch([m.data_symbol for m in markets], config.LOOKBACK_DAYS)
@@ -228,7 +248,9 @@ def run_universe(markets: list[Market], dry_run: bool) -> str:
             n_skipped += 1
             continue
         r = df.iloc[-1]
-        log.info("%-6s %s  close %.2f  MA%d %.2f  MA%d %.2f  %s", m.symbol, df.index[-1].date(), r.close,
+        if m.asset_class == "crypto":
+            m = replace(m, trade_size=round(config.CRYPTO_ORDER_USD / r.close, 9))
+        log.info("%-6s %s  close %.6g  MA%d %.6g  MA%d %.6g  %s", m.symbol, df.index[-1].date(), r.close,
                  config.FAST_MA_PERIOD, r.fast_ma, config.SLOW_MA_PERIOD, r.slow_ma, signal.value.upper())
         if signal is Signal.BUY:
             buys.append(m)
@@ -248,7 +270,7 @@ def run_universe(markets: list[Market], dry_run: bool) -> str:
     client = trading_client()
     positions = {p.symbol: float(p.qty) for p in client.get_all_positions()}
     open_symbols = {o.symbol for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))}
-    orders, notes = plan_orders(buys, sells, positions, open_symbols, config.MAX_BUYS_PER_RUN)
+    orders, notes = plan_orders(buys, sells, positions, open_symbols, max_buys)
     for note in notes:
         log.info(note)
     placed, failed = [], []
@@ -268,19 +290,20 @@ def run_universe(markets: list[Market], dry_run: bool) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="compute the signal but place no order")
-    parser.add_argument("--market", choices=sorted(config.MARKETS) + ["stocks"], default=os.getenv("BOT_MARKET", config.DEFAULT_MARKET),
+    parser.add_argument("--market", choices=sorted(config.MARKETS) + sorted(UNIVERSES), default=os.getenv("BOT_MARKET", config.DEFAULT_MARKET),
                         help="what to trade, from config.MARKETS (default: %(default)s)")
     parser.add_argument("--log-dir", default=os.getenv("BOT_LOG_DIR", "logs"), help="folder for daily log files")
     args = parser.parse_args()
-    if args.market != "stocks" and args.market not in config.MARKETS:
-        parser.error(f"unknown market {args.market!r}; choose from stocks, {', '.join(sorted(config.MARKETS))}")
+    if args.market not in UNIVERSES and args.market not in config.MARKETS:
+        parser.error(f"unknown market {args.market!r}; choose from {', '.join(sorted(UNIVERSES) + sorted(config.MARKETS))}")
 
     log_file = setup_logging(args.log_dir)
     mode = "dry run" if args.dry_run else "live, paper account"
     try:
-        if args.market == "stocks":
-            log.info("=== Run started: stock universe (%s) ===", mode)
-            outcome = run_universe(load_universe(), args.dry_run)
+        if args.market in UNIVERSES:
+            load, cap_setting = UNIVERSES[args.market]
+            log.info("=== Run started: %s universe (%s) ===", args.market, mode)
+            outcome = run_universe(load(), args.dry_run, getattr(config, cap_setting))
         else:
             market = config.MARKETS[args.market]
             log.info("=== Run started: %s (%s) ===", market.symbol, mode)
