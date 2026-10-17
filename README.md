@@ -3,6 +3,9 @@
 Buys when the 20-day moving average crosses above the 50-day one, sells when it crosses below,
 on an Alpaca **paper** account. Settings live in `config.py`.
 
+Markets are defined in `config.MARKETS`: `aapl` (default, 1 share) and `btc` (BTC/USD, 0.001 BTC).
+Pick one with `--market btc` or `BOT_MARKET=btc`.
+
 ## Setup
 ```bash
 pip install -r requirements.txt
@@ -13,6 +16,7 @@ cp .env.example .env   # then put your paper keys in .env
 ```bash
 python bot.py --dry-run   # show the signal, place nothing
 python bot.py             # place the order if a crossover happened
+python bot.py --market btc --dry-run   # same strategy on BTC/USD
 pytest                    # unit tests for the crossover logic
 ```
 
@@ -22,6 +26,8 @@ pytest                    # unit tests for the crossover logic
 - Buy: skipped if you already hold the stock or an order is already open (so running twice a day doesn't double-buy).
 - Sell: sells up to `TRADE_SIZE` shares you hold; it never sells short.
 - Refuses to run unless `APCA_API_BASE_URL` is the paper URL.
+- Crypto: orders use `gtc` (Alpaca crypto doesn't accept `day`), and since yfinance crypto bars are UTC days,
+  the current UTC day's bar is always dropped. Crypto trades 24/7, so it can run on any day.
 
 Run it once per day. It is scheduled every weekday at 9:30 ET (market open); at that time it uses the
 last completed daily bars (today's unfinished bar is dropped), and a market order fills right away.

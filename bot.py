@@ -3,6 +3,7 @@
 Run once a day (e.g. at the market open):
     python bot.py            # places an order if a crossover happened
     python bot.py --dry-run  # shows what it would do, places nothing
+    python bot.py --market btc --dry-run  # same strategy on BTC/USD (crypto trades 24/7)
 
 Every run is logged to the console and appended to logs/bot_YYYY-MM-DD.log
 (change the folder with --log-dir or the BOT_LOG_DIR environment variable).
@@ -12,7 +13,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 
 import config
+from config import Market
 from strategy import Signal, add_moving_averages, crossover_signal
 
 NY = ZoneInfo("America/New_York")
@@ -39,17 +41,29 @@ def setup_logging(log_dir: str) -> Path:
     return log_file
 
 
-def fetch_closes(symbol: str, days: int):
-    data = yf.Ticker(symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
-    if data.empty:
-        raise RuntimeError(f"yfinance returned no data for {symbol}")
-    closes = data["Close"]
-    # During market hours yfinance includes today's unfinished bar; only use completed days.
-    now = datetime.now(NY)
-    if now.hour < 16 and closes.index[-1].date() >= now.date():
-        log.info("Dropping today's unfinished bar (%s); using completed days only", closes.index[-1].date())
-        closes = closes.iloc[:-1]
+def drop_unfinished_bar(closes, asset_class: str, now: datetime):
+    """Only use completed daily bars.
+
+    Stocks: today's bar is unfinished until the 16:00 ET close.
+    Crypto: yfinance daily bars are UTC days, so today's bar is unfinished until UTC midnight.
+    """
+    last_day = closes.index[-1].date()
+    if asset_class == "crypto":
+        unfinished = last_day >= now.astimezone(timezone.utc).date()
+    else:
+        now_ny = now.astimezone(NY)
+        unfinished = now_ny.hour < 16 and last_day >= now_ny.date()
+    if unfinished:
+        log.info("Dropping today's unfinished bar (%s); using completed days only", last_day)
+        return closes.iloc[:-1]
     return closes
+
+
+def fetch_closes(market: Market, days: int):
+    data = yf.Ticker(market.data_symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
+    if data.empty:
+        raise RuntimeError(f"yfinance returned no data for {market.data_symbol}")
+    return drop_unfinished_bar(data["Close"], market.asset_class, datetime.now(NY))
 
 
 def trading_client():
@@ -70,7 +84,8 @@ def held_qty(client, symbol: str) -> float:
     from alpaca.common.exceptions import APIError
 
     try:
-        return float(client.get_open_position(symbol).qty)
+        # Positions use the symbol without the slash (BTC/USD -> BTCUSD).
+        return float(client.get_open_position(symbol.replace("/", "")).qty)
     except APIError:
         return 0.0
 
@@ -83,24 +98,32 @@ def has_open_order(client, symbol: str) -> bool:
     return len(orders) > 0
 
 
-def place_order(client, symbol: str, qty: float, side: str):
-    from alpaca.trading.enums import OrderSide, TimeInForce
+def time_in_force(asset_class: str):
+    from alpaca.trading.enums import TimeInForce
+
+    # Alpaca crypto orders accept only GTC or IOC, not DAY.
+    return TimeInForce.GTC if asset_class == "crypto" else TimeInForce.DAY
+
+
+def place_order(client, market: Market, qty: float, side: str):
+    from alpaca.trading.enums import OrderSide
     from alpaca.trading.requests import MarketOrderRequest
 
     order = client.submit_order(MarketOrderRequest(
-        symbol=symbol,
+        symbol=market.symbol,
         qty=qty,
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
+        time_in_force=time_in_force(market.asset_class),
     ))
-    log.info("Order submitted: %s %g %s (id %s, status %s)", side, qty, symbol, order.id, order.status.value)
+    log.info("Order submitted: %s %g %s (id %s, status %s)", side, qty, market.symbol, order.id, order.status.value)
     return order
 
 
-def run(dry_run: bool) -> str:
+def run(market: Market, dry_run: bool) -> str:
     """One bot run. Returns a one-line outcome."""
-    closes = fetch_closes(config.SYMBOL, config.LOOKBACK_DAYS)
-    log.info("Fetched %d daily closes for %s (%s to %s)", len(closes), config.SYMBOL,
+    sym = market.symbol
+    closes = fetch_closes(market, config.LOOKBACK_DAYS)
+    log.info("Fetched %d daily closes for %s (%s to %s)", len(closes), market.data_symbol,
              closes.index[0].date(), closes.index[-1].date())
     df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
     signal = crossover_signal(df)
@@ -111,37 +134,42 @@ def run(dry_run: bool) -> str:
     log.info("Signal: %s", signal.value.upper())
 
     if signal is Signal.HOLD:
-        return f"{config.SYMBOL} HOLD: no crossover, no order"
+        return f"{sym} HOLD: no crossover, no order"
     if dry_run:
-        return f"{config.SYMBOL} {signal.value.upper()}: dry run, would {signal.value} {config.TRADE_SIZE}, no order placed"
+        return f"{sym} {signal.value.upper()}: dry run, would {signal.value} {market.trade_size:g}, no order placed"
 
     client = trading_client()
-    if has_open_order(client, config.SYMBOL):
-        return f"{config.SYMBOL} {signal.value.upper()}: an order is already open, not placing another"
-    qty = held_qty(client, config.SYMBOL)
-    log.info("Current %s position: %g shares", config.SYMBOL, qty)
+    if has_open_order(client, sym):
+        return f"{sym} {signal.value.upper()}: an order is already open, not placing another"
+    qty = held_qty(client, sym)
+    log.info("Current %s position: %g", sym, qty)
 
     if signal is Signal.BUY:
         if qty > 0:
-            return f"{config.SYMBOL} BUY: already holding {qty:g}, skipped"
-        order = place_order(client, config.SYMBOL, config.TRADE_SIZE, "buy")
+            return f"{sym} BUY: already holding {qty:g}, skipped"
+        order = place_order(client, market, market.trade_size, "buy")
     else:
         if qty <= 0:
-            return f"{config.SYMBOL} SELL: no position to sell, skipped (never sells short)"
-        order = place_order(client, config.SYMBOL, min(config.TRADE_SIZE, qty), "sell")
-    return f"{config.SYMBOL} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
+            return f"{sym} SELL: no position to sell, skipped (never sells short)"
+        order = place_order(client, market, min(market.trade_size, qty), "sell")
+    return f"{sym} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="compute the signal but place no order")
+    parser.add_argument("--market", choices=sorted(config.MARKETS), default=os.getenv("BOT_MARKET", config.DEFAULT_MARKET),
+                        help="what to trade, from config.MARKETS (default: %(default)s)")
     parser.add_argument("--log-dir", default=os.getenv("BOT_LOG_DIR", "logs"), help="folder for daily log files")
     args = parser.parse_args()
+    if args.market not in config.MARKETS:
+        parser.error(f"unknown market {args.market!r}; choose from {', '.join(sorted(config.MARKETS))}")
 
     log_file = setup_logging(args.log_dir)
-    log.info("=== Run started (%s) ===", "dry run" if args.dry_run else "live, paper account")
+    market = config.MARKETS[args.market]
+    log.info("=== Run started: %s (%s) ===", market.symbol, "dry run" if args.dry_run else "live, paper account")
     try:
-        outcome = run(args.dry_run)
+        outcome = run(market, args.dry_run)
     except Exception as exc:
         log.exception("Run failed: %s", exc)
         log.info("RESULT: ERROR %s", exc)
