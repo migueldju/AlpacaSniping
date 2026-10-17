@@ -23,4 +23,11 @@ pytest                    # unit tests for the crossover logic
 - Sell: sells up to `TRADE_SIZE` shares you hold; it never sells short.
 - Refuses to run unless `APCA_API_BASE_URL` is the paper URL.
 
-Run it once per day, e.g. with cron after the close; a market order placed then fills at the next open.
+Run it once per day. It is scheduled every weekday at 9:30 ET (market open); at that time it uses the
+last completed daily bars (today's unfinished bar is dropped), and a market order fills right away.
+
+## Logs
+Every run appends timestamped lines (data fetched, MA values, signal, order id/status, errors) to
+`logs/bot_YYYY-MM-DD.log` and prints them to the console. The last line of each run starts with `RESULT:`.
+Choose another folder with `--log-dir` or `BOT_LOG_DIR`. The scheduled run writes to
+`/mnt/project-files/AlpacaSniping/logs/` in the project's shared folder.

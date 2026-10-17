@@ -1,13 +1,20 @@
 """Moving-average crossover bot for an Alpaca PAPER account.
 
-Run once a day after the market closes (or before it opens):
+Run once a day (e.g. at the market open):
     python bot.py            # places an order if a crossover happened
     python bot.py --dry-run  # shows what it would do, places nothing
+
+Every run is logged to the console and appended to logs/bot_YYYY-MM-DD.log
+(change the folder with --log-dir or the BOT_LOG_DIR environment variable).
 """
 
 import argparse
+import logging
 import os
 import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from dotenv import load_dotenv
@@ -15,12 +22,34 @@ from dotenv import load_dotenv
 import config
 from strategy import Signal, add_moving_averages, crossover_signal
 
+NY = ZoneInfo("America/New_York")
+log = logging.getLogger("bot")
+
+
+def setup_logging(log_dir: str) -> Path:
+    path = Path(log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    log_file = path / f"bot_{datetime.now(NY):%Y-%m-%d}.log"
+    fmt = logging.Formatter("%(asctime)s ET %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt.converter = lambda ts: datetime.fromtimestamp(ts, NY).timetuple()
+    for handler in (logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)):
+        handler.setFormatter(fmt)
+        log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    return log_file
+
 
 def fetch_closes(symbol: str, days: int):
     data = yf.Ticker(symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
     if data.empty:
         raise RuntimeError(f"yfinance returned no data for {symbol}")
-    return data["Close"]
+    closes = data["Close"]
+    # During market hours yfinance includes today's unfinished bar; only use completed days.
+    now = datetime.now(NY)
+    if now.hour < 16 and closes.index[-1].date() >= now.date():
+        log.info("Dropping today's unfinished bar (%s); using completed days only", closes.index[-1].date())
+        closes = closes.iloc[:-1]
+    return closes
 
 
 def trading_client():
@@ -31,9 +60,9 @@ def trading_client():
     secret = os.getenv("APCA_API_SECRET_KEY")
     base_url = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
     if not key or not secret:
-        sys.exit("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY. Copy .env.example to .env and fill it in.")
+        raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY. Copy .env.example to .env and fill it in.")
     if "paper-api" not in base_url:
-        sys.exit(f"Refusing to run: APCA_API_BASE_URL is not a paper trading URL ({base_url}).")
+        raise RuntimeError(f"Refusing to run: APCA_API_BASE_URL is not a paper trading URL ({base_url}).")
     return TradingClient(key, secret, paper=True)
 
 
@@ -64,47 +93,62 @@ def place_order(client, symbol: str, qty: float, side: str):
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
     ))
-    print(f"Order submitted: {side} {qty} {symbol} (id {order.id}, status {order.status})")
+    log.info("Order submitted: %s %g %s (id %s, status %s)", side, qty, symbol, order.id, order.status.value)
+    return order
+
+
+def run(dry_run: bool) -> str:
+    """One bot run. Returns a one-line outcome."""
+    closes = fetch_closes(config.SYMBOL, config.LOOKBACK_DAYS)
+    log.info("Fetched %d daily closes for %s (%s to %s)", len(closes), config.SYMBOL,
+             closes.index[0].date(), closes.index[-1].date())
+    df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
+    signal = crossover_signal(df)
+
+    for date, row in df.dropna().iloc[-2:].iterrows():
+        log.info("%s  close %.2f  MA%d %.2f  MA%d %.2f", date.date(), row.close,
+                 config.FAST_MA_PERIOD, row.fast_ma, config.SLOW_MA_PERIOD, row.slow_ma)
+    log.info("Signal: %s", signal.value.upper())
+
+    if signal is Signal.HOLD:
+        return f"{config.SYMBOL} HOLD: no crossover, no order"
+    if dry_run:
+        return f"{config.SYMBOL} {signal.value.upper()}: dry run, would {signal.value} {config.TRADE_SIZE}, no order placed"
+
+    client = trading_client()
+    if has_open_order(client, config.SYMBOL):
+        return f"{config.SYMBOL} {signal.value.upper()}: an order is already open, not placing another"
+    qty = held_qty(client, config.SYMBOL)
+    log.info("Current %s position: %g shares", config.SYMBOL, qty)
+
+    if signal is Signal.BUY:
+        if qty > 0:
+            return f"{config.SYMBOL} BUY: already holding {qty:g}, skipped"
+        order = place_order(client, config.SYMBOL, config.TRADE_SIZE, "buy")
+    else:
+        if qty <= 0:
+            return f"{config.SYMBOL} SELL: no position to sell, skipped (never sells short)"
+        order = place_order(client, config.SYMBOL, min(config.TRADE_SIZE, qty), "sell")
+    return f"{config.SYMBOL} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="compute the signal but place no order")
+    parser.add_argument("--log-dir", default=os.getenv("BOT_LOG_DIR", "logs"), help="folder for daily log files")
     args = parser.parse_args()
 
-    closes = fetch_closes(config.SYMBOL, config.LOOKBACK_DAYS)
-    df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
-    signal = crossover_signal(df)
-
-    last = df.dropna().iloc[-2:]
-    print(f"{config.SYMBOL}: {len(closes)} days of data")
-    for date, row in last.iterrows():
-        print(f"  {date.date()}  close {row.close:8.2f}  MA{config.FAST_MA_PERIOD} {row.fast_ma:8.2f}"
-              f"  MA{config.SLOW_MA_PERIOD} {row.slow_ma:8.2f}")
-    print(f"Signal: {signal.value.upper()}")
-
-    if signal is Signal.HOLD:
-        return
-    if args.dry_run:
-        print(f"Dry run: would {signal.value} {config.TRADE_SIZE} {config.SYMBOL}. No order placed.")
-        return
-
-    client = trading_client()
-    if has_open_order(client, config.SYMBOL):
-        print("An order for this symbol is already open; not placing another.")
-        return
-    qty = held_qty(client, config.SYMBOL)
-
-    if signal is Signal.BUY:
-        if qty > 0:
-            print(f"Already holding {qty:g} {config.SYMBOL}; skipping buy.")
-            return
-        place_order(client, config.SYMBOL, config.TRADE_SIZE, "buy")
-    else:
-        if qty <= 0:
-            print(f"No {config.SYMBOL} position to sell; skipping (the bot never sells short).")
-            return
-        place_order(client, config.SYMBOL, min(config.TRADE_SIZE, qty), "sell")
+    log_file = setup_logging(args.log_dir)
+    log.info("=== Run started (%s) ===", "dry run" if args.dry_run else "live, paper account")
+    try:
+        outcome = run(args.dry_run)
+    except Exception as exc:
+        log.exception("Run failed: %s", exc)
+        log.info("RESULT: ERROR %s", exc)
+        log.info("Log file: %s", log_file)
+        sys.exit(1)
+    log.info("RESULT: %s", outcome)
+    log.info("Log file: %s", log_file)
 
 
 if __name__ == "__main__":
