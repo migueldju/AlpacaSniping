@@ -72,6 +72,11 @@ The crossover earns far less than holding, mostly because it is out of the marke
 the trend filter halves the drawdown. The sample is today's liquid stocks, so delisted companies are
 missing (survivorship bias) and real results would likely be worse.
 
+## Dashboard
+`python export_dashboard.py --out dashboard_data --log-dir logs` exports the paper account (account, positions,
+last 200 orders, daily equity for a year) and every logged run result as JSON files. The scheduled run uploads
+them to the project's results dashboard after each run. Places no orders.
+
 ## Logs
 Every run appends timestamped lines (data fetched, MA values, signal, order id/status, errors) to
 `logs/bot_YYYY-MM-DD.log` and prints them to the console. The last line of each run starts with `RESULT:`.
