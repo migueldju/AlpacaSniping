@@ -61,9 +61,14 @@ def drop_unfinished_bar(closes, asset_class: str, now: datetime):
 
 
 def fetch_closes(market: Market, days: int):
-    data = yf.Ticker(market.data_symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
-    if data.empty:
-        raise RuntimeError(f"yfinance returned no data for {market.data_symbol}")
+    if market.asset_class == "crypto":
+        data = fetch_crypto_batch([market.data_symbol], days).get(market.data_symbol)
+        if data is None:
+            raise RuntimeError(f"Alpaca returned no data for {market.data_symbol}")
+    else:
+        data = yf.Ticker(market.data_symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
+        if data.empty:
+            raise RuntimeError(f"yfinance returned no data for {market.data_symbol}")
     closes = drop_unfinished_bar(data["Close"], market.asset_class, datetime.now(NY))
     if len(closes) < len(data):
         log.info("Dropping today's unfinished bar (%s); using completed days only", data.index[-1].date())
@@ -86,6 +91,23 @@ def fetch_history_batch(tickers: list[str], days: int, chunk: int = 200) -> dict
     return out
 
 
+def fetch_crypto_batch(symbols: list[str], days: int) -> dict:
+    """Daily crypto bars from Alpaca market data (UTC days): {symbol: DataFrame with Close and Volume}."""
+    from datetime import timedelta
+
+    from alpaca.data.historical import CryptoHistoricalDataClient
+    from alpaca.data.requests import CryptoBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    request = CryptoBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame.Day,
+                                start=datetime.now(timezone.utc) - timedelta(days=days))
+    df = CryptoHistoricalDataClient().get_crypto_bars(request).df
+    if df.empty:
+        return {}
+    df = df.rename(columns={"close": "Close", "volume": "Volume"})
+    return {s: df.xs(s)[["Close", "Volume"]] for s in df.index.get_level_values(0).unique()}
+
+
 def load_universe(path=None) -> list[Market]:
     path = Path(path or config.UNIVERSE_FILE)
     symbols = [line.split("#")[0].strip() for line in path.read_text().splitlines()]
@@ -94,7 +116,7 @@ def load_universe(path=None) -> list[Market]:
 
 def crypto_universe() -> list[Market]:
     # trade_size is set per run from the price and CRYPTO_ORDER_USD
-    return [Market(s, t, "crypto", 0) for s, t in config.CRYPTO_UNIVERSE.items()]
+    return [Market(s, s, "crypto", 0) for s in config.CRYPTO_UNIVERSE]
 
 
 UNIVERSES = {
@@ -231,12 +253,16 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
 def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
     """One run over many symbols: batch download, one log line per symbol, then capped orders."""
     log.info("Universe: %d symbols", len(markets))
-    bars = fetch_history_batch([m.data_symbol for m in markets], config.LOOKBACK_DAYS)
+    stock_tickers = [m.data_symbol for m in markets if m.asset_class != "crypto"]
+    crypto_symbols = [m.data_symbol for m in markets if m.asset_class == "crypto"]
+    bars = fetch_history_batch(stock_tickers, config.LOOKBACK_DAYS) if stock_tickers else {}
+    if crypto_symbols:
+        bars.update(fetch_crypto_batch(crypto_symbols, config.LOOKBACK_DAYS))
     now = datetime.now(NY)
     buys, sells, n_hold, n_skipped = [], [], 0, 0
     for m in markets:
         if m.data_symbol not in bars:
-            log.info("%-6s no data from yfinance, skipped", m.symbol)
+            log.info("%-6s no price data, skipped", m.symbol)
             n_skipped += 1
             continue
         closes = drop_unfinished_bar(bars[m.data_symbol]["Close"], m.asset_class, now)

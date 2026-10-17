@@ -25,7 +25,7 @@ def test_aapl_market_unchanged():
 
 def test_btc_market():
     m = config.MARKETS["btc"]
-    assert (m.symbol, m.data_symbol, m.asset_class) == ("BTC/USD", "BTC-USD", "crypto")
+    assert (m.symbol, m.data_symbol, m.asset_class) == ("BTC/USD", "BTC/USD", "crypto")
     assert 0 < m.trade_size < 1
 
 
@@ -93,8 +93,8 @@ def test_plan_orders_matches_crypto_positions_without_slash():
     assert any("BTC/USD" in n and "already held" in n for n in notes)
 
 
-def test_crypto_universe_has_no_stablecoins_or_rounded_coins():
+def test_crypto_universe_has_no_stablecoins():
     symbols = set(config.CRYPTO_UNIVERSE)
-    assert "BTC/USD" in symbols
-    assert not symbols & {"USDC/USD", "USDT/USD", "USDG/USD", "BONK/USD", "SHIB/USD", "PEPE/USD"}
+    assert {"BTC/USD", "PEPE/USD", "SHIB/USD", "BONK/USD"} <= symbols
+    assert not symbols & {"USDC/USD", "USDT/USD", "USDG/USD"}
     assert all(s.endswith("/USD") for s in symbols)

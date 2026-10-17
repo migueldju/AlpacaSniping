@@ -8,8 +8,8 @@ What it trades is chosen with `--market` or `BOT_MARKET`:
   (average daily traded value of at least `MIN_DOLLAR_VOLUME`, $20M), 1 share each. Data is downloaded in
   batches, every symbol gets one log line, and at most `MAX_BUYS_PER_RUN` (5) new buys are placed per run,
   most traded first. Sells are not capped. Rebuild the list with `python build_universe.py`.
-- `crypto`: every non-stablecoin USD pair on Alpaca listed in `config.CRYPTO_UNIVERSE` (30 coins; BONK, SHIB
-  and PEPE are left out because Yahoo rounds their prices). Each buy is worth `CRYPTO_ORDER_USD` ($100), at
+- `crypto`: every non-stablecoin USD pair on Alpaca listed in `config.CRYPTO_UNIVERSE` (33 coins), priced
+  with Alpaca's own market data (`data.alpaca.markets`), which keeps every decimal of coins like PEPE. Each buy is worth `CRYPTO_ORDER_USD` ($100), at
   most `MAX_CRYPTO_BUYS_PER_RUN` (3) per run. Crypto bars close at 00:00 UTC every day, so run it daily
   shortly after that (weekends included), separately from the weekday stock run.
 - `aapl` (1 share) and `btc` (BTC/USD, 0.001 BTC), defined in `config.MARKETS`.
@@ -32,12 +32,12 @@ pytest                    # unit tests for the crossover logic
 ```
 
 ## How it decides
-- Downloads `LOOKBACK_DAYS` of daily closes from yfinance and computes simple moving averages.
+- Downloads `LOOKBACK_DAYS` of daily closes (yfinance for stocks, Alpaca for crypto) and computes simple moving averages.
 - A crossover is real only if the fast MA was on one side of the slow MA yesterday and on the other side today.
 - Buy: skipped if you already hold the stock or an order is already open (so running twice a day doesn't double-buy).
 - Sell: sells up to `TRADE_SIZE` shares you hold; it never sells short.
 - Refuses to run unless `APCA_API_BASE_URL` is the paper URL.
-- Crypto: orders use `gtc` (Alpaca crypto doesn't accept `day`), and since yfinance crypto bars are UTC days,
+- Crypto: orders use `gtc` (Alpaca crypto doesn't accept `day`), and since crypto bars are UTC days,
   the current UTC day's bar is always dropped. Crypto trades 24/7, so it can run on any day.
 
 Run it once per day. It is scheduled every weekday at 9:30 ET (market open); at that time it uses the
