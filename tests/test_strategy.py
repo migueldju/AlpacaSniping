@@ -56,3 +56,31 @@ def test_not_enough_data_raises():
 def test_fast_must_be_shorter():
     with pytest.raises(ValueError):
         add_moving_averages(pd.Series(range(100)), 50, 20)
+
+
+def test_trend_filter_blocks_buy_below_long_average():
+    from strategy import trend_allows_buy
+    # long decline then a short bounce: fast crosses slow but price is still under the 200-day average
+    prices = pd.Series([200 - i * 0.5 for i in range(250)] + [75 + i * 0.8 for i in range(30)])
+    df = add_moving_averages(prices, 20, 50, 200)
+    assert df.close.iloc[-1] < df.trend_ma.iloc[-1]
+    assert not trend_allows_buy(df)
+
+
+def test_trend_filter_allows_buy_above_long_average_and_is_off_without_column():
+    from strategy import trend_allows_buy
+    prices = pd.Series([100 + i * 0.5 for i in range(250)])
+    assert trend_allows_buy(add_moving_averages(prices, 20, 50, 200))
+    assert trend_allows_buy(add_moving_averages(prices, 20, 50))
+
+
+def test_trend_filter_blocks_without_enough_history():
+    from strategy import trend_allows_buy
+    assert not trend_allows_buy(add_moving_averages(pd.Series(range(1, 100)), 20, 50, 200))
+
+
+def test_stop_loss_hit():
+    from strategy import stop_loss_hit
+    assert stop_loss_hit(100, 90, 0.10)
+    assert not stop_loss_hit(100, 90.01, 0.10)
+    assert not stop_loss_hit(100, 50, 0)

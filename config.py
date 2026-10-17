@@ -1,6 +1,7 @@
 """Bot settings. Edit these values to change what the bot trades."""
 
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 
 
@@ -45,4 +46,14 @@ MAX_CRYPTO_BUYS_PER_RUN = 3  # at most this many new crypto buys per run; sells 
 
 FAST_MA_PERIOD = 20    # short moving average, in daily bars
 SLOW_MA_PERIOD = 50    # long moving average, in daily bars
-LOOKBACK_DAYS = 100    # days of history to download from yfinance
+TREND_MA_PERIOD = 200  # trend filter: buy only if the close is above this moving average (0 turns it off)
+LOOKBACK_DAYS = 400    # calendar days of history to download from yfinance (enough for TREND_MA_PERIOD bars)
+
+# Risk limits, checked on every live universe run (stocks and crypto alike).
+MAX_POSITION_PCT = 0.05  # one buy may not bring a position above 5% of account equity
+MAX_INVESTED_PCT = 0.50  # all positions together (plus today's buys) may not exceed 50% of equity
+STOP_LOSS_PCT = 0.10     # sell a whole position once it is 10% below its average entry price (8% tested worse)
+
+# Stocks: the bot runs at 15:50 ET, so from STOCK_BAR_CUTOFF on it treats today's bar as the day's close
+# (the price is a few minutes from final) and can act on the crossover day itself. Earlier, today's bar is dropped.
+STOCK_BAR_CUTOFF = time(15, 30)

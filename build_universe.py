@@ -3,7 +3,7 @@
     python build_universe.py
 
 Takes Alpaca's active, tradable, fractionable and marginable assets on NYSE, NASDAQ, ARCA, AMEX and BATS,
-downloads 100 days of yfinance data, and keeps symbols whose average daily traded value over the last
+downloads config.LOOKBACK_DAYS of yfinance data, and keeps symbols whose average daily traded value over the last
 20 days is at least config.MIN_DOLLAR_VOLUME and that have enough history for the slow moving average.
 Places no orders.
 """
