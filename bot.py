@@ -5,6 +5,8 @@ Run once a day (e.g. at the market open):
     python bot.py --dry-run  # shows what it would do, places nothing
     python bot.py --market btc --dry-run  # same strategy on BTC/USD (crypto trades 24/7)
 
+    python bot.py --market stocks         # every symbol in config.UNIVERSE_FILE (the default)
+
 Every run is logged to the console and appended to logs/bot_YYYY-MM-DD.log
 (change the folder with --log-dir or the BOT_LOG_DIR environment variable).
 """
@@ -53,17 +55,39 @@ def drop_unfinished_bar(closes, asset_class: str, now: datetime):
     else:
         now_ny = now.astimezone(NY)
         unfinished = now_ny.hour < 16 and last_day >= now_ny.date()
-    if unfinished:
-        log.info("Dropping today's unfinished bar (%s); using completed days only", last_day)
-        return closes.iloc[:-1]
-    return closes
+    return closes.iloc[:-1] if unfinished else closes
 
 
 def fetch_closes(market: Market, days: int):
     data = yf.Ticker(market.data_symbol).history(period=f"{days}d", interval="1d", auto_adjust=True)
     if data.empty:
         raise RuntimeError(f"yfinance returned no data for {market.data_symbol}")
-    return drop_unfinished_bar(data["Close"], market.asset_class, datetime.now(NY))
+    closes = drop_unfinished_bar(data["Close"], market.asset_class, datetime.now(NY))
+    if len(closes) < len(data):
+        log.info("Dropping today's unfinished bar (%s); using completed days only", data.index[-1].date())
+    return closes
+
+
+def fetch_history_batch(tickers: list[str], days: int, chunk: int = 200) -> dict:
+    """Daily bars for many yfinance tickers at once: {ticker: DataFrame with Close and Volume}."""
+    out = {}
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        data = yf.download(part, period=f"{days}d", interval="1d", auto_adjust=True,
+                           progress=False, group_by="ticker", threads=True)
+        for t in part:
+            if t in data.columns.get_level_values(0):
+                bars = data[t].dropna(subset=["Close"])
+                if not bars.empty:
+                    out[t] = bars
+        log.info("Downloaded %d/%d tickers", min(i + chunk, len(tickers)), len(tickers))
+    return out
+
+
+def load_universe(path=None) -> list[Market]:
+    path = Path(path or config.UNIVERSE_FILE)
+    symbols = [line.split("#")[0].strip() for line in path.read_text().splitlines()]
+    return [Market(s, s.replace(".", "-"), "stock", config.STOCK_TRADE_SIZE) for s in symbols if s]
 
 
 def trading_client():
@@ -155,21 +179,112 @@ def run(market: Market, dry_run: bool) -> str:
     return f"{sym} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
 
 
+def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_symbols: set, max_buys: int):
+    """Decide which signals become orders. Returns (orders, notes), orders as (market, side, qty).
+
+    Sells first, only for symbols held (never short). Buys in the given order (most traded first),
+    skipping symbols already held, and at most max_buys of them. Symbols with an open order are skipped.
+    """
+    orders, notes = [], []
+    for m in sells:
+        qty = positions.get(m.symbol, 0.0)
+        if m.symbol in open_symbols:
+            notes.append(f"{m.symbol} SELL skipped: order already open")
+        elif qty <= 0:
+            notes.append(f"{m.symbol} SELL skipped: not held")
+        else:
+            orders.append((m, "sell", min(m.trade_size, qty)))
+    n_buys = 0
+    for m in buys:
+        if m.symbol in open_symbols:
+            notes.append(f"{m.symbol} BUY skipped: order already open")
+        elif positions.get(m.symbol, 0.0) > 0:
+            notes.append(f"{m.symbol} BUY skipped: already held")
+        elif n_buys >= max_buys:
+            notes.append(f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached")
+        else:
+            orders.append((m, "buy", m.trade_size))
+            n_buys += 1
+    return orders, notes
+
+
+def run_universe(markets: list[Market], dry_run: bool) -> str:
+    """One run over many symbols: batch download, one log line per symbol, then capped orders."""
+    log.info("Universe: %d symbols", len(markets))
+    bars = fetch_history_batch([m.data_symbol for m in markets], config.LOOKBACK_DAYS)
+    now = datetime.now(NY)
+    buys, sells, n_hold, n_skipped = [], [], 0, 0
+    for m in markets:
+        if m.data_symbol not in bars:
+            log.info("%-6s no data from yfinance, skipped", m.symbol)
+            n_skipped += 1
+            continue
+        closes = drop_unfinished_bar(bars[m.data_symbol]["Close"], m.asset_class, now)
+        try:
+            df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
+            signal = crossover_signal(df)
+        except ValueError as exc:
+            log.info("%-6s skipped: %s", m.symbol, exc)
+            n_skipped += 1
+            continue
+        r = df.iloc[-1]
+        log.info("%-6s %s  close %.2f  MA%d %.2f  MA%d %.2f  %s", m.symbol, df.index[-1].date(), r.close,
+                 config.FAST_MA_PERIOD, r.fast_ma, config.SLOW_MA_PERIOD, r.slow_ma, signal.value.upper())
+        if signal is Signal.BUY:
+            buys.append(m)
+        elif signal is Signal.SELL:
+            sells.append(m)
+        else:
+            n_hold += 1
+    summary = (f"{len(markets)} symbols: {len(buys)} BUY [{' '.join(m.symbol for m in buys)}], "
+               f"{len(sells)} SELL [{' '.join(m.symbol for m in sells)}], {n_hold} HOLD, {n_skipped} skipped")
+    log.info("Signals: %s", summary)
+    if dry_run:
+        return f"{summary}; dry run, no orders placed"
+
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+
+    client = trading_client()
+    positions = {p.symbol: float(p.qty) for p in client.get_all_positions()}
+    open_symbols = {o.symbol for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))}
+    orders, notes = plan_orders(buys, sells, positions, open_symbols, config.MAX_BUYS_PER_RUN)
+    for note in notes:
+        log.info(note)
+    placed, failed = [], []
+    for m, side, qty in orders:
+        try:
+            place_order(client, m, qty, side)
+            placed.append(f"{side} {qty:g} {m.symbol}")
+        except Exception as exc:
+            log.error("%s %s failed: %s", side, m.symbol, exc)
+            failed.append(m.symbol)
+    result = f"{summary}; orders placed: {', '.join(placed) or 'none'}"
+    if failed:
+        result += f"; failed: {' '.join(failed)}"
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="compute the signal but place no order")
-    parser.add_argument("--market", choices=sorted(config.MARKETS), default=os.getenv("BOT_MARKET", config.DEFAULT_MARKET),
+    parser.add_argument("--market", choices=sorted(config.MARKETS) + ["stocks"], default=os.getenv("BOT_MARKET", config.DEFAULT_MARKET),
                         help="what to trade, from config.MARKETS (default: %(default)s)")
     parser.add_argument("--log-dir", default=os.getenv("BOT_LOG_DIR", "logs"), help="folder for daily log files")
     args = parser.parse_args()
-    if args.market not in config.MARKETS:
-        parser.error(f"unknown market {args.market!r}; choose from {', '.join(sorted(config.MARKETS))}")
+    if args.market != "stocks" and args.market not in config.MARKETS:
+        parser.error(f"unknown market {args.market!r}; choose from stocks, {', '.join(sorted(config.MARKETS))}")
 
     log_file = setup_logging(args.log_dir)
-    market = config.MARKETS[args.market]
-    log.info("=== Run started: %s (%s) ===", market.symbol, "dry run" if args.dry_run else "live, paper account")
+    mode = "dry run" if args.dry_run else "live, paper account"
     try:
-        outcome = run(market, args.dry_run)
+        if args.market == "stocks":
+            log.info("=== Run started: stock universe (%s) ===", mode)
+            outcome = run_universe(load_universe(), args.dry_run)
+        else:
+            market = config.MARKETS[args.market]
+            log.info("=== Run started: %s (%s) ===", market.symbol, mode)
+            outcome = run(market, args.dry_run)
     except Exception as exc:
         log.exception("Run failed: %s", exc)
         log.info("RESULT: ERROR %s", exc)

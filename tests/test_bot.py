@@ -7,7 +7,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
-from bot import drop_unfinished_bar, time_in_force  # noqa: E402
+from bot import drop_unfinished_bar, load_universe, plan_orders, time_in_force  # noqa: E402
 from alpaca.trading.enums import TimeInForce  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
@@ -19,7 +19,7 @@ def closes(last_day, tz):
 
 
 def test_aapl_market_unchanged():
-    m = config.MARKETS[config.DEFAULT_MARKET]
+    m = config.MARKETS["aapl"]
     assert (m.symbol, m.data_symbol, m.asset_class, m.trade_size) == ("AAPL", "AAPL", "stock", 1)
 
 
@@ -53,3 +53,34 @@ def test_crypto_drops_current_utc_day_even_in_evening():
 def test_crypto_keeps_yesterdays_bar():
     s = closes("2026-10-16", timezone.utc)
     assert len(drop_unfinished_bar(s, "crypto", datetime(2026, 10, 17, 1, 0, tzinfo=timezone.utc))) == 3
+
+
+def stock(symbol):
+    return config.Market(symbol, symbol, "stock", 1)
+
+
+def test_plan_orders_caps_buys_in_order():
+    buys = [stock(s) for s in ["KO", "LIN", "SAP", "AIG"]]
+    orders, notes = plan_orders(buys, [], {}, set(), max_buys=2)
+    assert [(m.symbol, side) for m, side, _ in orders] == [("KO", "buy"), ("LIN", "buy")]
+    assert any("SAP" in n and "limit" in n for n in notes)
+
+
+def test_plan_orders_skips_held_and_open_without_using_the_cap():
+    buys = [stock(s) for s in ["KO", "LIN", "SAP"]]
+    orders, _ = plan_orders(buys, [], {"KO": 1.0}, {"LIN"}, max_buys=1)
+    assert [m.symbol for m, _, _ in orders] == ["SAP"]
+
+
+def test_plan_orders_sells_only_held_and_never_more_than_held():
+    sells = [stock("STX"), stock("GLW")]
+    orders, notes = plan_orders([], sells, {"STX": 0.5}, set(), max_buys=0)
+    assert [(m.symbol, side, qty) for m, side, qty in orders] == [("STX", "sell", 0.5)]
+    assert any("GLW" in n and "not held" in n for n in notes)
+
+
+def test_load_universe_ignores_comments_and_maps_class_shares(tmp_path):
+    f = tmp_path / "u.txt"
+    f.write_text("# header\nAAPL\nBRK.B\n\n")
+    markets = load_universe(f)
+    assert [(m.symbol, m.data_symbol, m.asset_class) for m in markets] == [("AAPL", "AAPL", "stock"), ("BRK.B", "BRK-B", "stock")]

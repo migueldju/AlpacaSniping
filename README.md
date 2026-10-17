@@ -3,8 +3,12 @@
 Buys when the 20-day moving average crosses above the 50-day one, sells when it crosses below,
 on an Alpaca **paper** account. Settings live in `config.py`.
 
-Markets are defined in `config.MARKETS`: `aapl` (default, 1 share) and `btc` (BTC/USD, 0.001 BTC).
-Pick one with `--market btc` or `BOT_MARKET=btc`.
+What it trades is chosen with `--market` or `BOT_MARKET`:
+- `stocks` (default): every symbol in `universe_stocks.txt`, the liquid US stocks and ETFs on Alpaca
+  (average daily traded value of at least `MIN_DOLLAR_VOLUME`, $20M), 1 share each. Data is downloaded in
+  batches, every symbol gets one log line, and at most `MAX_BUYS_PER_RUN` (5) new buys are placed per run,
+  most traded first. Sells are not capped. Rebuild the list with `python build_universe.py`.
+- `aapl` (1 share) and `btc` (BTC/USD, 0.001 BTC), defined in `config.MARKETS`.
 
 ## Setup
 ```bash
@@ -17,6 +21,8 @@ cp .env.example .env   # then put your paper keys in .env
 python bot.py --dry-run   # show the signal, place nothing
 python bot.py             # place the order if a crossover happened
 python bot.py --market btc --dry-run   # same strategy on BTC/USD
+python bot.py --market aapl            # only AAPL
+python build_universe.py               # refresh the stock list (places no orders)
 pytest                    # unit tests for the crossover logic
 ```
 
