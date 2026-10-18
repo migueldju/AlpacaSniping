@@ -7,7 +7,7 @@ from risk import Position, cap_buys, stop_loss_exits  # noqa: E402
 
 
 def stock(symbol):
-    return config.Market(symbol, symbol, "stock", 1)
+    return config.Market(symbol, symbol, "stock")
 
 
 def test_stop_loss_exits_only_this_asset_class_below_the_stop():
@@ -18,22 +18,22 @@ def test_stop_loss_exits_only_this_asset_class_below_the_stop():
 
 
 def test_cap_buys_per_position_limit_counts_what_is_already_held():
-    kept, notes = cap_buys([(stock("NVR"), 1), (stock("KO"), 1)], {"NVR": 6000, "KO": 60}, equity=100_000,
+    kept, notes = cap_buys([(stock("NVR"), 6000), (stock("KO"), 60)], equity=100_000,
                            held_value={"KO": 4950}, invested=4950, max_position_pct=0.05, max_invested_pct=0.5)
     assert kept == []
     assert any("NVR" in n and "5%" in n for n in notes) and any("KO" in n for n in notes)
 
 
 def test_cap_buys_total_limit_keeps_priority_order():
-    buys = [(stock(s), 1) for s in ["A", "B", "C"]]
-    kept, notes = cap_buys(buys, {"A": 4000, "B": 4000, "C": 100}, equity=100_000, held_value={},
+    buys = [(stock("A"), 4000), (stock("B"), 4000), (stock("C"), 100)]
+    kept, notes = cap_buys(buys, equity=100_000, held_value={},
                            invested=44_000, max_position_pct=0.05, max_invested_pct=0.5)
     assert [m.symbol for m, _ in kept] == ["A", "C"]
     assert any("B" in n and "total" in n for n in notes)
 
 
 def test_cap_buys_matches_crypto_positions_without_slash():
-    btc = config.Market("BTC/USD", "BTC-USD", "crypto", 0.001)
-    kept, _ = cap_buys([(btc, 0.001)], {"BTC/USD": 100_000}, equity=100_000, held_value={"BTCUSD": 4950},
+    btc = config.Market("BTC/USD", "BTC-USD", "crypto")
+    kept, _ = cap_buys([(btc, 100)], equity=100_000, held_value={"BTCUSD": 4950},
                        invested=0, max_position_pct=0.05, max_invested_pct=0.5)
     assert kept == []

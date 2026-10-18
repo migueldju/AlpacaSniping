@@ -28,18 +28,17 @@ def stop_loss_exits(positions: list[Position], asset_class: str, stop_pct: float
             and stop_loss_hit(p.avg_entry_price, p.current_price, stop_pct)]
 
 
-def cap_buys(buys: list, prices: dict, equity: float, held_value: dict, invested: float,
+def cap_buys(buys: list, equity: float, held_value: dict, invested: float,
              max_position_pct: float, max_invested_pct: float):
     """Drop buys that would break a limit. Returns (kept, notes).
 
-    buys: (market, qty) in priority order. prices: symbol -> price. held_value: position key -> dollars held.
+    buys: (market, dollars) in priority order. held_value: position key -> dollars held.
     A buy is skipped if it would bring its position above max_position_pct of equity, or the total invested
     (positions plus the buys kept so far) above max_invested_pct of equity.
     """
     kept, notes = [], []
     position_cap, total_cap = equity * max_position_pct, equity * max_invested_pct
-    for market, qty in buys:
-        value = qty * prices[market.symbol]
+    for market, value in buys:
         held = held_value.get(market.symbol.replace("/", ""), 0.0)
         if held + value > position_cap:
             notes.append(f"{market.symbol} BUY skipped: ${value:,.0f} would exceed the "
@@ -48,6 +47,6 @@ def cap_buys(buys: list, prices: dict, equity: float, held_value: dict, invested
             notes.append(f"{market.symbol} BUY skipped: total invested would exceed "
                          f"{max_invested_pct:.0%} of equity (${total_cap:,.0f})")
         else:
-            kept.append((market, qty))
+            kept.append((market, value))
             invested += value
     return kept, notes
