@@ -46,7 +46,7 @@ pytest                    # unit tests
 - Stop-loss: any position of the asset class being run that is `STOP_LOSS_PCT` (10%) below its average entry
   price is sold in full, whether or not its moving averages crossed. It is checked once per run, at the run's price.
 - Per position: a buy is skipped if it would bring that position above `MAX_POSITION_PCT` (5%) of account equity.
-- Total: a buy is skipped if all positions together would go above `MAX_INVESTED_PCT` (50%) of equity.
+- Total: a buy is skipped if all positions together would go above `MAX_INVESTED_PCT` (100%) of equity, so the bot never borrows on margin.
 - Then the per-run buy caps (`MAX_BUYS_PER_RUN`, `MAX_CRYPTO_BUYS_PER_RUN`) apply, most traded first.
 - Buy: skipped if you already hold the stock or an order is already open (so running twice a day doesn't double-buy).
 - Sell: sells the whole position; it never sells short.

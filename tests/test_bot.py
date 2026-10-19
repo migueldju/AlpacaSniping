@@ -158,6 +158,7 @@ def test_run_universe_applies_trend_filter_stop_loss_and_position_limit(monkeypa
     data = {"UP": bars(uptrend_cross), "DOWN": bars(downtrend_cross), "PRICY": bars([p * 100 for p in uptrend_cross]),
             "MU": bars([100.0] * 300)}
     monkeypatch.setattr(bot, "fetch_history_batch", lambda tickers, days: data)
+    monkeypatch.setattr(bot.config, "MAX_INVESTED_PCT", 0.50)
     # MU is 15% under its entry (stop-loss); BIG brings the account to 44% invested
     client = FakeClient(100_000, [("MU", 2, 100, 85), ("BIG", 1, 44_000, 44_000)])
     monkeypatch.setattr(bot, "trading_client", lambda: client)

@@ -53,7 +53,7 @@ MIN_ORDER_USD = 1         # Alpaca's smallest fractional order
 
 # Risk limits, checked on every live universe run (stocks and crypto alike).
 MAX_POSITION_PCT = 0.05  # one buy may not bring a position above 5% of account equity
-MAX_INVESTED_PCT = 0.50  # all positions together (plus today's buys) may not exceed 50% of equity
+MAX_INVESTED_PCT = 1.00  # all positions together (plus today's buys) may not exceed 100% of equity: no margin
 STOP_LOSS_PCT = 0.10     # sell a whole position once it is 10% below its average entry price (8% tested worse)
 
 # Stocks: the bot runs at 15:50 ET, so from STOCK_BAR_CUTOFF on it treats today's bar as the day's close
