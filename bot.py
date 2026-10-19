@@ -1,6 +1,6 @@
 """Moving-average crossover bot for an Alpaca PAPER account.
 
-Run once a day (e.g. at the market open):
+Run once a day, at 15:50 ET for stocks (just before the close, so it trades on the crossover day):
     python bot.py            # places an order if a crossover happened
     python bot.py --dry-run  # shows what it would do, places nothing
     python bot.py --market btc --dry-run  # same strategy on BTC/USD (crypto trades 24/7)
@@ -16,7 +16,6 @@ import argparse
 import logging
 import os
 import sys
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,7 +25,8 @@ from dotenv import load_dotenv
 
 import config
 from config import Market
-from strategy import Signal, add_moving_averages, crossover_signal
+from risk import Position, cap_buys, stop_loss_exits
+from strategy import Signal, add_moving_averages, crossover_signal, trend_allows_buy
 
 NY = ZoneInfo("America/New_York")
 log = logging.getLogger("bot")
@@ -48,7 +48,8 @@ def setup_logging(log_dir: str) -> Path:
 def drop_unfinished_bar(closes, asset_class: str, now: datetime):
     """Only use completed daily bars.
 
-    Stocks: today's bar is unfinished until the 16:00 ET close.
+    Stocks: today's bar is unfinished until config.STOCK_BAR_CUTOFF (15:30 ET); from then on its price is
+    within minutes of the close and the bot treats it as the day's close.
     Crypto: yfinance daily bars are UTC days, so today's bar is unfinished until UTC midnight.
     """
     last_day = closes.index[-1].date()
@@ -56,7 +57,7 @@ def drop_unfinished_bar(closes, asset_class: str, now: datetime):
         unfinished = last_day >= now.astimezone(timezone.utc).date()
     else:
         now_ny = now.astimezone(NY)
-        unfinished = now_ny.hour < 16 and last_day >= now_ny.date()
+        unfinished = now_ny.time() < config.STOCK_BAR_CUTOFF and last_day >= now_ny.date()
     return closes.iloc[:-1] if unfinished else closes
 
 
@@ -89,12 +90,11 @@ def fetch_history_batch(tickers: list[str], days: int, chunk: int = 200) -> dict
 def load_universe(path=None) -> list[Market]:
     path = Path(path or config.UNIVERSE_FILE)
     symbols = [line.split("#")[0].strip() for line in path.read_text().splitlines()]
-    return [Market(s, s.replace(".", "-"), "stock", config.STOCK_TRADE_SIZE) for s in symbols if s]
+    return [Market(s, s.replace(".", "-"), "stock") for s in symbols if s]
 
 
 def crypto_universe() -> list[Market]:
-    # trade_size is set per run from the price and CRYPTO_ORDER_USD
-    return [Market(s, t, "crypto", 0) for s, t in config.CRYPTO_UNIVERSE.items()]
+    return [Market(s, t, "crypto") for s, t in config.CRYPTO_UNIVERSE.items()]
 
 
 UNIVERSES = {
@@ -106,6 +106,13 @@ UNIVERSES = {
 def position_key(symbol: str) -> str:
     """Alpaca reports crypto positions without the slash (BTC/USD -> BTCUSD); compare symbols this way."""
     return symbol.replace("/", "")
+
+
+def alpaca_symbol(position: Position) -> str:
+    """Order symbol for a position: crypto positions come back without the slash (BTCUSD -> BTC/USD)."""
+    if position.asset_class == "crypto" and "/" not in position.symbol and position.symbol.endswith("USD"):
+        return position.symbol[:-3] + "/USD"
+    return position.symbol
 
 
 def trading_client():
@@ -147,18 +154,31 @@ def time_in_force(asset_class: str):
     return TimeInForce.GTC if asset_class == "crypto" else TimeInForce.DAY
 
 
-def place_order(client, market: Market, qty: float, side: str):
+def buy_usd(equity: float):
+    """Dollar size of one buy: BUY_PCT_OF_EQUITY of equity, rounded down to the cent; None if below MIN_ORDER_USD."""
+    usd = int(equity * config.BUY_PCT_OF_EQUITY * 100) / 100
+    return usd if usd >= config.MIN_ORDER_USD else None
+
+
+def place_order(client, market: Market, qty: float | None, side: str, notional: float | None = None):
+    """Market order for qty units, or for a dollar amount (notional) when qty is None."""
     from alpaca.trading.enums import OrderSide
     from alpaca.trading.requests import MarketOrderRequest
 
     order = client.submit_order(MarketOrderRequest(
         symbol=market.symbol,
         qty=qty,
+        notional=notional,
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=time_in_force(market.asset_class),
     ))
-    log.info("Order submitted: %s %g %s (id %s, status %s)", side, qty, market.symbol, order.id, order.status.value)
+    log.info("Order submitted: %s %s %s (id %s, status %s)", side, describe_size(qty, notional), market.symbol,
+             order.id, order.status.value)
     return order
+
+
+def describe_size(qty, notional) -> str:
+    return f"${notional:,.2f} of" if qty is None else f"{qty:g}"
 
 
 def run(market: Market, dry_run: bool) -> str:
@@ -167,18 +187,20 @@ def run(market: Market, dry_run: bool) -> str:
     closes = fetch_closes(market, config.LOOKBACK_DAYS)
     log.info("Fetched %d daily closes for %s (%s to %s)", len(closes), market.data_symbol,
              closes.index[0].date(), closes.index[-1].date())
-    df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
+    df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD, config.TREND_MA_PERIOD)
     signal = crossover_signal(df)
 
-    for date, row in df.dropna().iloc[-2:].iterrows():
+    for date, row in df.dropna(subset=["fast_ma", "slow_ma"]).iloc[-2:].iterrows():
         log.info("%s  close %.2f  MA%d %.2f  MA%d %.2f", date.date(), row.close,
                  config.FAST_MA_PERIOD, row.fast_ma, config.SLOW_MA_PERIOD, row.slow_ma)
     log.info("Signal: %s", signal.value.upper())
+    if signal is Signal.BUY and not trend_allows_buy(df):
+        return f"{sym} BUY blocked: close is not above its {config.TREND_MA_PERIOD}-day average (trend filter), no order"
 
     if signal is Signal.HOLD:
         return f"{sym} HOLD: no crossover, no order"
     if dry_run:
-        return f"{sym} {signal.value.upper()}: dry run, would {signal.value} {market.trade_size:g}, no order placed"
+        return f"{sym} {signal.value.upper()}: dry run, would {signal.value}, no order placed"
 
     client = trading_client()
     if has_open_order(client, sym):
@@ -189,18 +211,22 @@ def run(market: Market, dry_run: bool) -> str:
     if signal is Signal.BUY:
         if qty > 0:
             return f"{sym} BUY: already holding {qty:g}, skipped"
-        order = place_order(client, market, market.trade_size, "buy")
+        usd = buy_usd(float(client.get_account().equity))
+        if usd is None:
+            return f"{sym} BUY: account too small for a ${config.MIN_ORDER_USD} order, skipped"
+        order = place_order(client, market, None, "buy", notional=usd)
     else:
         if qty <= 0:
             return f"{sym} SELL: no position to sell, skipped (never sells short)"
-        order = place_order(client, market, min(market.trade_size, qty), "sell")
+        order = place_order(client, market, qty, "sell")
     return f"{sym} {signal.value.upper()}: order {order.id} submitted ({order.status.value})"
 
 
 def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_symbols: set, max_buys: int):
     """Decide which signals become orders. Returns (orders, notes), orders as (market, side, qty).
 
-    Sells first, only for symbols held (never short). Buys in the given order (most traded first),
+    Sells first, the whole position, only for symbols held (never short). Buys have qty None: they are sized
+    in dollars later. Buys in the given order (most traded first),
     skipping symbols already held, and at most max_buys of them. Symbols with an open order are skipped.
     """
     positions = {position_key(k): v for k, v in positions.items()}
@@ -213,7 +239,7 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
         elif qty <= 0:
             notes.append(f"{m.symbol} SELL skipped: not held")
         else:
-            orders.append((m, "sell", min(m.trade_size, qty)))
+            orders.append((m, "sell", qty))
     n_buys = 0
     for m in buys:
         if position_key(m.symbol) in open_symbols:
@@ -223,7 +249,7 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
         elif n_buys >= max_buys:
             notes.append(f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached")
         else:
-            orders.append((m, "buy", m.trade_size))
+            orders.append((m, "buy", None))
             n_buys += 1
     return orders, notes
 
@@ -233,7 +259,7 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
     log.info("Universe: %d symbols", len(markets))
     bars = fetch_history_batch([m.data_symbol for m in markets], config.LOOKBACK_DAYS)
     now = datetime.now(NY)
-    buys, sells, n_hold, n_skipped = [], [], 0, 0
+    buys, sells, n_hold, n_trend, n_skipped = [], [], 0, 0, 0
     for m in markets:
         if m.data_symbol not in bars:
             log.info("%-6s no data from yfinance, skipped", m.symbol)
@@ -241,15 +267,18 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
             continue
         closes = drop_unfinished_bar(bars[m.data_symbol]["Close"], m.asset_class, now)
         try:
-            df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD)
+            df = add_moving_averages(closes, config.FAST_MA_PERIOD, config.SLOW_MA_PERIOD, config.TREND_MA_PERIOD)
             signal = crossover_signal(df)
         except ValueError as exc:
             log.info("%-6s skipped: %s", m.symbol, exc)
             n_skipped += 1
             continue
         r = df.iloc[-1]
-        if m.asset_class == "crypto":
-            m = replace(m, trade_size=round(config.CRYPTO_ORDER_USD / r.close, 9))
+        if signal is Signal.BUY and not trend_allows_buy(df):
+            log.info("%-6s BUY blocked by the trend filter: close %.6g is not above MA%d %.6g", m.symbol, r.close,
+                     config.TREND_MA_PERIOD, r.get("trend_ma", float("nan")))
+            n_trend += 1
+            continue
         log.info("%-6s %s  close %.6g  MA%d %.6g  MA%d %.6g  %s", m.symbol, df.index[-1].date(), r.close,
                  config.FAST_MA_PERIOD, r.fast_ma, config.SLOW_MA_PERIOD, r.slow_ma, signal.value.upper())
         if signal is Signal.BUY:
@@ -259,7 +288,8 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
         else:
             n_hold += 1
     summary = (f"{len(markets)} symbols: {len(buys)} BUY [{' '.join(m.symbol for m in buys)}], "
-               f"{len(sells)} SELL [{' '.join(m.symbol for m in sells)}], {n_hold} HOLD, {n_skipped} skipped")
+               f"{len(sells)} SELL [{' '.join(m.symbol for m in sells)}], {n_hold} HOLD, "
+               f"{n_trend} BUY blocked by trend filter, {n_skipped} skipped")
     log.info("Signals: %s", summary)
     if dry_run:
         return f"{summary}; dry run, no orders placed"
@@ -268,16 +298,44 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
     from alpaca.trading.requests import GetOrdersRequest
 
     client = trading_client()
-    positions = {p.symbol: float(p.qty) for p in client.get_all_positions()}
+    equity = float(client.get_account().equity)
+    held = [Position(p.symbol, float(p.qty), float(p.avg_entry_price), float(p.current_price),
+                     "crypto" if p.asset_class.value == "crypto" else "stock") for p in client.get_all_positions()]
     open_symbols = {o.symbol for o in client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))}
-    orders, notes = plan_orders(buys, sells, positions, open_symbols, max_buys)
+    open_keys = {position_key(s) for s in open_symbols}
+
+    # 1. Stop-loss: sell every position of this asset class that fell STOP_LOSS_PCT below its entry price.
+    asset_class = markets[0].asset_class if markets else "stock"
+    stops = [p for p in stop_loss_exits(held, asset_class, config.STOP_LOSS_PCT) if p.symbol not in open_keys]
+    stopped = {p.symbol for p in stops}
+    for p in stops:
+        log.info("%s STOP-LOSS: %+.1f%% from entry %.6g (now %.6g), selling all %g", p.symbol, p.change_pct,
+                 p.avg_entry_price, p.current_price, p.qty)
+    orders = [(Market(alpaca_symbol(p), alpaca_symbol(p), p.asset_class), "sell", p.qty, None) for p in stops]
+
+    # 2. Crossover signals (the stop-loss already sells its symbols), then the per-position and total limits,
+    #    then the per-run buy cap.
+    sells = [m for m in sells if position_key(m.symbol) not in stopped]
+    planned, notes = plan_orders(buys, sells, {p.symbol: p.qty for p in held}, open_symbols, max_buys=len(buys))
+    usd = buy_usd(equity)
+    if usd is None:
+        notes.append(f"No buys: equity ${equity:,.2f} is too small for a ${config.MIN_ORDER_USD} order")
+    candidates = [(m, usd) for m, side, _ in planned if side == "buy"] if usd else []
+    kept, risk_notes = cap_buys(candidates, equity,
+                                {p.symbol: p.market_value for p in held},
+                                sum(p.market_value for p in held if p.symbol not in stopped),
+                                config.MAX_POSITION_PCT, config.MAX_INVESTED_PCT)
+    notes += risk_notes + [f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached" for m, _ in kept[max_buys:]]
+    orders += [(m, side, qty, None) for m, side, qty in planned if side == "sell"]
+    orders += [(m, "buy", None, usd) for m, usd in kept[:max_buys]]
+    log.info("Account equity $%s; %d stop-loss exits", f"{equity:,.0f}", len(stops))
     for note in notes:
         log.info(note)
     placed, failed = [], []
-    for m, side, qty in orders:
+    for m, side, qty, notional in orders:
         try:
-            place_order(client, m, qty, side)
-            placed.append(f"{side} {qty:g} {m.symbol}")
+            place_order(client, m, qty, side, notional)
+            placed.append(f"{side} {describe_size(qty, notional).removesuffix(' of')} {m.symbol}")
         except Exception as exc:
             log.error("%s %s failed: %s", side, m.symbol, exc)
             failed.append(m.symbol)
