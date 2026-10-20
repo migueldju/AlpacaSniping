@@ -48,7 +48,7 @@ LOOKBACK_DAYS = 400    # calendar days of history to download from yfinance (eno
 
 # Order size: every buy is a dollar amount (fractional shares or coins), BUY_PCT_OF_EQUITY of account equity,
 # rounded down to the cent and at least MIN_ORDER_USD. Sells always sell the whole position.
-BUY_PCT_OF_EQUITY = 0.05  # 5% of equity per buy: $50 on a $1,000 account
+BUY_PCT_OF_EQUITY = 0.025  # 2.5% of equity per buy: $25 on a $1,000 account (variant "PR5 2.5%")
 MIN_ORDER_USD = 1         # Alpaca's smallest fractional order
 
 # Risk limits, checked on every live universe run (stocks and crypto alike).

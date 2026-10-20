@@ -92,8 +92,9 @@ def test_load_universe_ignores_comments_and_maps_class_shares(tmp_path):
     assert [(m.symbol, m.data_symbol, m.asset_class) for m in markets] == [("AAPL", "AAPL", "stock"), ("BRK.B", "BRK-B", "stock")]
 
 
-def test_buy_usd_is_5pct_of_equity_rounded_down_and_skips_tiny_accounts():
+def test_buy_usd_is_5pct_of_equity_rounded_down_and_skips_tiny_accounts(monkeypatch):
     from bot import buy_usd
+    monkeypatch.setattr(config, "BUY_PCT_OF_EQUITY", 0.05)
     assert buy_usd(1000) == 50
     assert buy_usd(1234.56) == 61.72
     assert buy_usd(10) is None
@@ -159,6 +160,7 @@ def test_run_universe_applies_trend_filter_stop_loss_and_position_limit(monkeypa
             "MU": bars([100.0] * 300)}
     monkeypatch.setattr(bot, "fetch_history_batch", lambda tickers, days: data)
     monkeypatch.setattr(bot.config, "MAX_INVESTED_PCT", 0.50)
+    monkeypatch.setattr(bot.config, "BUY_PCT_OF_EQUITY", 0.05)
     # MU is 15% under its entry (stop-loss); BIG brings the account to 44% invested
     client = FakeClient(100_000, [("MU", 2, 100, 85), ("BIG", 1, 44_000, 44_000)])
     monkeypatch.setattr(bot, "trading_client", lambda: client)
