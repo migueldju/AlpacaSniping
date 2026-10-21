@@ -254,7 +254,7 @@ def plan_orders(buys: list[Market], sells: list[Market], positions: dict, open_s
     return orders, notes
 
 
-def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
+def run_universe(markets: list[Market], dry_run: bool, max_buys: int | None) -> str:
     """One run over many symbols: batch download, one log line per symbol, then capped orders."""
     log.info("Universe: %d symbols", len(markets))
     bars = fetch_history_batch([m.data_symbol for m in markets], config.LOOKBACK_DAYS)
@@ -325,6 +325,8 @@ def run_universe(markets: list[Market], dry_run: bool, max_buys: int) -> str:
                                 {p.symbol: p.market_value for p in held},
                                 sum(p.market_value for p in held if p.symbol not in stopped),
                                 config.MAX_POSITION_PCT, config.MAX_INVESTED_PCT)
+    if max_buys is None:  # no per-run cap: only cash and the risk limits stop buys
+        max_buys = len(kept)
     notes += risk_notes + [f"{m.symbol} BUY skipped: limit of {max_buys} buys per run reached" for m, _ in kept[max_buys:]]
     orders += [(m, side, qty, None) for m, side, qty in planned if side == "sell"]
     orders += [(m, "buy", None, usd) for m, usd in kept[:max_buys]]

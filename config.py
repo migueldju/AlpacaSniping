@@ -24,7 +24,7 @@ DEFAULT_MARKET = "stocks"
 # Rebuild it with `python build_universe.py` (it applies MIN_DOLLAR_VOLUME).
 UNIVERSE_FILE = Path(__file__).resolve().parent / "universe_stocks.txt"
 MIN_DOLLAR_VOLUME = 20_000_000  # average daily traded value over 20 days, in USD
-MAX_BUYS_PER_RUN = 5            # at most this many new buys per run (most traded first); sells are not capped
+MAX_BUYS_PER_RUN = None         # at most this many new buys per run (most traded first), None = no cap; sells are not capped
 
 # The "crypto" universe: every non-stablecoin USD pair on Alpaca, Alpaca symbol -> yfinance ticker.
 # Left out: stablecoins (USDC, USDT, USDG) and BONK, SHIB, PEPE, whose Yahoo prices are rounded to $0.000001,

@@ -170,3 +170,17 @@ def test_run_universe_applies_trend_filter_stop_loss_and_position_limit(monkeypa
     # account to 49% invested, so PRICY would pass the 50% limit.
     assert client.orders == [("MU", "sell", 2.0, None), ("UP", "buy", None, 5000.0)]
     assert "1 BUY blocked by trend filter" in result
+
+
+def test_run_universe_without_buy_cap_buys_every_signal(monkeypatch):
+    import bot
+    cross = up_to_first_buy([100 + i * 0.2 for i in range(260)] + [152 - i for i in range(25)]
+                            + [127 + i * 3 for i in range(30)])
+    names = ["A", "B", "C", "D", "E", "F", "G"]
+    monkeypatch.setattr(bot, "fetch_history_batch", lambda tickers, days: {n: bars(cross) for n in names})
+    monkeypatch.setattr(bot.config, "BUY_PCT_OF_EQUITY", 0.025)
+    client = FakeClient(100_000, [])
+    monkeypatch.setattr(bot, "trading_client", lambda: client)
+
+    bot.run_universe([stock(s) for s in names], dry_run=False, max_buys=None)
+    assert client.orders == [(n, "buy", None, 2500.0) for n in names]
